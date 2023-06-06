@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+test -z "$(type -p)" || { echo bash required; exit 1; }
+set -Eeuo pipefail
+source "${RRCONFINC}"
+
+# set up default for all arguments
+#
+: ${VMNAME:=}
+: ${VMTYPE:=part}
+: ${VMGBRAM:=4}
+: ${VMCPU:=2}
+: ${VMOCTET2:=00}
+: ${VMOCTET3:=}
+: ${VMOCTET4:=}
+: ${VMDISKFILE=$(printf "/media/data/images/kvm-cilium-k3s_oci-amd64-1061.0-local_%s.qcow2" "${VMNAME}")}
+
+# fix arguments
+#
+if [[ -z ${VMOCTET3} ]]; then
+  VMOCTET3=$(ip -j a show dev lo | jq '.[].addr_info[] | select(.scope | contains("global"))|.local' | awk -F':' '{print substr($4,3)}')
+fi
+VMOCTET3_IP=${VMOCTET3}
+
+test -n "${VMOCTET4}" ||
+  fail "Missing value for VMOCTET4"
+
+if (( VMOCTET4 < 2 | VMOCTET4 > 99 )); then
+  fail "Octet 4 is out of range 2-99: $VMOCTET4"
+fi
+
+VMOCTET4_IP="$VMOCTET4"
+VMOCTET4=$( printf "%02d" ${VMOCTET4//[^0-9]} )
+
+
+##
+# define virtual machine according to variables
+VirshDefine() {
+  local xmlname=/media/data/images/${VMNAME}.xml
+
+  logv redefining ${VMNAME} machine  
+  tplrender ${VMTYPE}.xml > "${xmlname}"
+  virsh undefine "${VMNAME}" || true
+  virsh define "${xmlname}"
+}
+
+##
+# create vm disk if does not exist
+CreateDisk() {
+  local original="/media/data/images/kvm-cilium-k3s_oci-amd64-1061.0-local.qcow2"
+  
+  test -f "${VMDISKFILE}" &&
+    return 0
+
+  logv creating disk for ${VMNAME}
+  cp "${original}" "${VMDISKFILE}"
+  qemu-img resize "${VMDISKFILE}" +50G
+}
+
+## main body
+#
+virsh dumpxml "${VMNAME}" >/dev/null 2>&1 ||
+  VirshDefine
+
+test -f ${VMDISKFILE} ||
+  CreateDisk
+
+state="$(virsh domstate "${VMNAME}" 2>/dev/null| head -n1)" || true
+if [[ $state == running ]]; then
+  exit 0
+fi
+logv starting machine ${VMNAME}
+virsh start "${VMNAME}"
+
+sleep 15
+while true; do
+  sleep 1
+  virsh qemu-agent-command "${VMNAME}" \
+    '{"execute":"guest-exec", "arguments": { "path": "/usr/bin/hostname", "capture-output": true}}' >/dev/null 2>&1 &&
+    break ||
+    echo -n .
+done
+
+echo
+sleep 1
+
+logv running qemu agent commands
+
+qemucmd() {
+  local cmd=$1; shift
+  printf '{"execute":"guest-exec", "arguments": { "path": "%s", "arg" : [' "$cmd"
+  while (( $# > 0 )); do
+    printf '"%s"' $1
+    if (( $# > 1 )); then
+      printf ', '
+    fi
+    shift
+  done
+  printf '], "capture-output": true}}'
+  echo
+}
+
+virsh qemu-agent-command "${VMNAME}" \
+  '{"execute":"guest-exec", "arguments": { "path": "/usr/sbin/usermod", "arg" : ["--password","$y$j9T$Iaw.SLF0vGb7IKruN208k1$TK/FTY4np6GPcqdr4fxqiiBazOW4Nz9bbCDnFUPtUr4","root"], "capture-output": true}}'
+
+# set network
+virsh qemu-agent-command "${VMNAME}" "$(qemucmd /sbin/ip addr add 10.0.${VMOCTET3_IP}.${VMOCTET4_IP}/24 dev enp5s0)"
+# check if IP was configured
+while true; do
+  sleep 3
+  ping -c1 10.0.${VMOCTET3_IP}.${VMOCTET4_IP} &>/dev/null &&
+    break ||
+    virsh qemu-agent-command "${VMNAME}" "$(qemucmd /sbin/ip addr add 10.0.${VMOCTET3_IP}.${VMOCTET4_IP}/24 dev enp5s0)"
+    sleep 3
+done
+
+virsh qemu-agent-command "${VMNAME}" "$(qemucmd /sbin/ip route add default via 10.0.${VMOCTET3_IP}.1)"
+virsh qemu-agent-command "${VMNAME}" "$(qemucmd /sbin/ip link set enp5s0 mtu 1452)"
+
+# set hostname
+virsh qemu-agent-command "${VMNAME}" "$(qemucmd /usr/bin/hostnamectl hostname ${VMNAME})"
+
+# configure DNS
+virsh qemu-agent-command "${VMNAME}" "$(qemucmd /usr/bin/sed -i 's/#DNS=/DNS=8.8.8.8/' /etc/systemd/resolved.conf)"
+virsh qemu-agent-command "${VMNAME}" "$(qemucmd /usr/bin/systemctl restart systemd-resolved)"
+sleep 3
+
+# install rrconf
+virsh qemu-agent-command "${VMNAME}" "$(qemucmd /usr/bin/apt install -y git)"
+virsh qemu-agent-command "${VMNAME}" "$(qemucmd /usr/bin/wget https://raw.githubusercontent.com/rrconf/rrconf/master/install.sh -O /root/install.sh)"
+sleep 15
+virsh qemu-agent-command "${VMNAME}" "$(qemucmd /usr/bin/bash -x /root/install.sh)"
+sleep 5
+virsh qemu-agent-command "${VMNAME}" '{"execute":"guest-exec", "arguments": { "path": "/usr/bin/bash" , "arg" : ["-c","/usr/bin/echo https://group_182781_bot:glpat-jSzATqDcFV-54bPkjaBi@gitlab.devops.telekom.de/cas-devs/osc/onmetal/conf/ > /etc/rrconf/repos.d/10-repoconf"],"capture-output": true}}'
+virsh qemu-agent-command "${VMNAME}" '{"execute":"guest-exec", "arguments": { "path": "/usr/bin/bash" , "arg" : ["-c","/usr/bin/echo RRMODPULL=always > /etc/rrconf/rrconf.conf"],"capture-output": true}}'
+
+# create local users on VM
+virsh qemu-agent-command "${VMNAME}" "$(qemucmd /usr/bin/require local-users-dev-lab)"
